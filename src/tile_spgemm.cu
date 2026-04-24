@@ -74,6 +74,15 @@ typedef struct {
     unsigned short *d_mask;
 } TiledMatrix;
 
+typedef struct {
+    int *h_colPtr;        /* [tilen+1] */
+    int *h_rowIdx;        /* [numTiles] */
+    int *h_tilePos;       /* [numTiles] -> original tile position */
+    int *d_colPtr;
+    int *d_rowIdx;
+    int *d_tilePos;
+} TileColumnIndex;
+
 /* ─── Convert CSR → TiledMatrix (host) ─────────────────────────────────── */
 static void csr_to_tiled(const CsrMatrix *A, TiledMatrix *T)
 {
@@ -219,6 +228,65 @@ static double tiled_upload(TiledMatrix *T)
     return (wtime()-t0)*1e3;
 }
 
+static void build_tile_column_index(const TiledMatrix *T, TileColumnIndex *X)
+{
+    X->h_colPtr = (int*)calloc((size_t)T->tilen + 1, sizeof(int));
+    X->h_rowIdx = (int*)malloc((size_t)T->numTiles * sizeof(int));
+    X->h_tilePos = (int*)malloc((size_t)T->numTiles * sizeof(int));
+
+    for (int tr = 0; tr < T->tilem; tr++) {
+        for (int pos = T->h_tilePtr[tr]; pos < T->h_tilePtr[tr + 1]; pos++) {
+            int tc = T->h_tileColIdx[pos];
+            X->h_colPtr[tc + 1]++;
+        }
+    }
+    for (int tc = 0; tc < T->tilen; tc++) {
+        X->h_colPtr[tc + 1] += X->h_colPtr[tc];
+    }
+
+    int *cursor = (int*)malloc((size_t)T->tilen * sizeof(int));
+    memcpy(cursor, X->h_colPtr, (size_t)T->tilen * sizeof(int));
+    for (int tr = 0; tr < T->tilem; tr++) {
+        for (int pos = T->h_tilePtr[tr]; pos < T->h_tilePtr[tr + 1]; pos++) {
+            int tc = T->h_tileColIdx[pos];
+            int idx = cursor[tc]++;
+            X->h_rowIdx[idx] = tr;
+            X->h_tilePos[idx] = pos;
+        }
+    }
+    free(cursor);
+
+    X->d_colPtr = NULL;
+    X->d_rowIdx = NULL;
+    X->d_tilePos = NULL;
+}
+
+static void upload_tile_column_index(const TiledMatrix *T, TileColumnIndex *X)
+{
+    CUDA_CHECK(cudaMalloc(&X->d_colPtr, ((size_t)T->tilen + 1) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&X->d_rowIdx, (size_t)T->numTiles * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&X->d_tilePos, (size_t)T->numTiles * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(X->d_colPtr, X->h_colPtr,
+                          ((size_t)T->tilen + 1) * sizeof(int),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(X->d_rowIdx, X->h_rowIdx,
+                          (size_t)T->numTiles * sizeof(int),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(X->d_tilePos, X->h_tilePos,
+                          (size_t)T->numTiles * sizeof(int),
+                          cudaMemcpyHostToDevice));
+}
+
+static void free_tile_column_index(TileColumnIndex *X)
+{
+    free(X->h_colPtr);
+    free(X->h_rowIdx);
+    free(X->h_tilePos);
+    if (X->d_colPtr) cudaFree(X->d_colPtr);
+    if (X->d_rowIdx) cudaFree(X->d_rowIdx);
+    if (X->d_tilePos) cudaFree(X->d_tilePos);
+}
+
 static void tiled_free(TiledMatrix *T)
 {
     free(T->h_tilePtr); free(T->h_tileColIdx); free(T->h_tileNnz);
@@ -359,8 +427,9 @@ void step2_symbolic_kernel(
     const unsigned char  *A_rowPtr, /* [numTiles_A * TILE_DIM] */
     const unsigned short *A_mask,   /* [numTiles_A * TILE_DIM] */
     /* B tile structure (B = A for A^2) */
-    const int *B_tilePtr,
-    const int *B_tileColIdx,
+    const int *B_colPtr,
+    const int *B_rowIdxByCol,
+    const int *B_tilePosByCol,
     const int *B_tileNnz,
     const unsigned char  *B_rowPtr,
     const unsigned short *B_mask,
@@ -371,7 +440,7 @@ void step2_symbolic_kernel(
     unsigned char  *C_rowPtr,  /* [numTiles_C * TILE_DIM] – output */
     unsigned short *C_mask,    /* [numTiles_C * TILE_DIM] – output */
     int numTilesC,
-    int tilem_A, int tilen_A)
+    int tilem_A)
 {
     /* One warp per output tile */
     int tid   = blockIdx.x * blockDim.x + threadIdx.x;
@@ -401,9 +470,9 @@ void step2_symbolic_kernel(
 
     /* Lengths of A's tile row and B's tile column */
     int lenA = A_tilePtr[tile_i+1] - A_tilePtr[tile_i];
-    int lenB = B_tilePtr[tile_j+1] - B_tilePtr[tile_j];
+    int lenB = B_colPtr[tile_j+1] - B_colPtr[tile_j];
     int baseA = A_tilePtr[tile_i];
-    int baseB = B_tilePtr[tile_j];
+    int baseB = B_colPtr[tile_j];
 
     /* Shared memory for mask accumulation (16 unsigned ints, wide enough for AtomicOr) */
     __shared__ unsigned int s_mask[32][TILE_DIM];  /* 32 warps max per block */
@@ -415,12 +484,11 @@ void step2_symbolic_kernel(
     /* Each lane processes one A tile, does binary search in B */
     for (int ia = lane; ia < lenA; ia += WARP_SIZE) {
         int col_a = A_tileColIdx[baseA + ia];   /* = row index of B tile */
-        /* Search col_a in B's tile-column col j */
-        int found_b = binary_search_tile(B_tileColIdx + baseB, lenB, col_a);
+        int found_b = binary_search_tile(B_rowIdxByCol + baseB, lenB, col_a);
         if (found_b < 0) continue;
         /* We have match: A tile at (tile_i, col_a), B tile at (col_a, tile_j) */
         int posA = baseA + ia;
-        int posB = baseB + found_b;
+        int posB = B_tilePosByCol[baseB + found_b];
         int nnzA_tile = A_tileNnz[posA];
         /* Traverse all nonzeros of A tile and AtomicOr B's mask rows */
         /* rowPtr has 16 entries; nnz in row r = rowPtr[r+1]-rowPtr[r]
@@ -498,7 +566,7 @@ void step3_numeric_kernel(
     unsigned char *C_rowIdx_out,
     unsigned char *C_colIdx_out,
     double        *C_val_out,
-    int numTilesC, int tilem_A, int tilen_A)
+    int numTilesC, int tilem_A)
 {
     int tid  = blockIdx.x * blockDim.x + threadIdx.x;
     int wid  = tid / WARP_SIZE;
@@ -582,6 +650,7 @@ void step3_numeric_kernel(
 /* ─── Host-side Step 3 (numeric, CPU reference matching GPU structure) ─── */
 static void step3_numeric_cpu(
     const TiledMatrix *A, const TiledMatrix *B,
+    const TileColumnIndex *Bcol,
     const int *h_tilePtrC, const int *h_tileColIdxC,
     const int *h_tileNnzC, const unsigned char *h_rowPtrC,
     const unsigned short *h_maskC,
@@ -619,11 +688,10 @@ static void step3_numeric_cpu(
         if (tile_i < 0) continue;
 
         int lenA = A->h_tilePtr[tile_i+1] - A->h_tilePtr[tile_i];
-        int lenB = B->h_tilePtr[tile_j+1] - B->h_tilePtr[tile_j];
+        int lenB = Bcol->h_colPtr[tile_j+1] - Bcol->h_colPtr[tile_j];
         int baseA = A->h_tilePtr[tile_i];
-        int baseB = B->h_tilePtr[tile_j];
+        int baseB = Bcol->h_colPtr[tile_j];
         int outBase = prefix[wid];
-        int nnzC_tile = h_tileNnzC[wid];
 
         /* Fill col indices for C from mask */
         /* colIdx[out_base + offset] = column of nonzero in this tile */
@@ -653,12 +721,12 @@ static void step3_numeric_cpu(
             int found_b=-1;
             {
                 int lo=0,hi=lenB-1;
-                while(lo<=hi){int mid=(lo+hi)/2; int v=B->h_tileColIdx[baseB+mid];
+                while(lo<=hi){int mid=(lo+hi)/2; int v=Bcol->h_rowIdx[baseB+mid];
                     if(v==col_a){found_b=mid;break;} else if(v<col_a)lo=mid+1; else hi=mid-1;}
             }
             if(found_b<0) continue;
             int posA = baseA+ia;
-            int posB = baseB+found_b;
+            int posB = Bcol->h_tilePos[baseB+found_b];
             int nnzA_t = A->h_tileNnz[posA];
             int nnzB_t = B->h_tileNnz[posB];
             int offA = prefA[posA];
@@ -680,7 +748,6 @@ static void step3_numeric_cpu(
                     accum[ra*TILE_DIM+cb] += va*vb;
                 }
             }
-            (void)nnzC_tile;
         }
 
         /* Write accumulated values into val array (positions already set by colIdx/rowIdx) */
@@ -802,6 +869,10 @@ int main(int argc, char **argv)
     memcpy(&TB, &TA, sizeof(TiledMatrix));
     /* TB shares TA's device pointers – do NOT free TB separately */
 
+    TileColumnIndex TBcol;
+    build_tile_column_index(&TB, &TBcol);
+    upload_tile_column_index(&TB, &TBcol);
+
     /* ─────────────────── STEP 1 ─────────────────── */
     fprintf(stderr, "[TileSpGEMM] Step 1: Computing tile structure of C ...\n");
     cudaEvent_t ev0, ev1;
@@ -842,11 +913,11 @@ int main(int argc, char **argv)
     step2_symbolic_kernel<<<num_blocks, threads_per_block>>>(
         TA.d_tilePtr, TA.d_tileColIdx, TA.d_tileNnz,
         TA.d_rowPtr, TA.d_mask,
-        TB.d_tilePtr, TB.d_tileColIdx, TB.d_tileNnz,
+        TBcol.d_colPtr, TBcol.d_rowIdx, TBcol.d_tilePos, TB.d_tileNnz,
         TB.d_rowPtr, TB.d_mask,
         d_tilePtrC, d_tileColIdxC,
         d_tileNnzC, d_rowPtrC, d_maskC,
-        numTilesC, TA.tilem, TA.tilen);
+        numTilesC, TA.tilem);
     CUDA_CHECK(cudaEventRecord(ev1));
     CUDA_CHECK(cudaEventSynchronize(ev1));
     float t_step2_ms_f;
@@ -878,7 +949,7 @@ int main(int argc, char **argv)
     unsigned char *h_rowIdxC=NULL, *h_colIdxC_res=NULL;
     double *h_valC_res=NULL;
     int nnzC_check=0;
-    step3_numeric_cpu(&TA, &TB,
+    step3_numeric_cpu(&TA, &TB, &TBcol,
                       h_tilePtrC, h_tileColIdxC,
                       h_tileNnzC, h_rowPtrC, h_maskC,
                       numTilesC,
@@ -903,6 +974,8 @@ int main(int argc, char **argv)
     /* Peak memory estimate */
     size_t peak_bytes =
         2*tiled_bytes +   /* A and B (shared) = 1 copy */
+        (size_t)(TB.tilen + 1) * sizeof(int) +
+        (size_t)TB.numTiles * 2 * sizeof(int) +
         (size_t)numTilesC*(sizeof(int)*2+TILE_DIM*(sizeof(unsigned char)+sizeof(unsigned short))) +
         (size_t)nnzC_total*(2*sizeof(unsigned char)+sizeof(double));
 
@@ -953,6 +1026,7 @@ int main(int argc, char **argv)
     TB.h_tilePtr=NULL; TB.h_tileColIdx=NULL; TB.h_tileNnz=NULL;
     TB.h_rowPtr=NULL; TB.h_rowIdx=NULL; TB.h_colIdx=NULL;
     TB.h_val=NULL; TB.h_mask=NULL;
+    free_tile_column_index(&TBcol);
     tiled_free(&TA);
     free(A.rowPtr); free(A.colIdx); free(A.val);
     cudaEventDestroy(ev0); cudaEventDestroy(ev1);
