@@ -46,7 +46,7 @@ def autolabel(bars):
     for bar in bars:
         h = bar.get_height()
         if h > 0:
-            ax.annotate(f'{h:.1f}',
+            ax.annotate(f'{h:.4f}',
                         xy=(bar.get_x() + bar.get_width()/2, h),
                         xytext=(0, 3), textcoords='offset points',
                         ha='center', va='bottom', fontsize=7, rotation=45)
@@ -66,10 +66,10 @@ ax.legend(fontsize=10, loc='upper right')
 # Annotate 0.00 for failures
 for i,(rg,tg) in enumerate(zip(row_gflops, tile_gflops)):
     if rg == 0:
-        ax.text(x[i]-w/2, 0.3, '0.00', ha='center', va='bottom',
+        ax.text(x[i]-w/2, 0.3, '0.0000', ha='center', va='bottom',
                 fontsize=7, color='red', rotation=90)
     if tg == 0:
-        ax.text(x[i]+w/2, 0.3, '0.00', ha='center', va='bottom',
+        ax.text(x[i]+w/2, 0.3, '0.0000', ha='center', va='bottom',
                 fontsize=7, color='red', rotation=90)
 
 plt.tight_layout()
