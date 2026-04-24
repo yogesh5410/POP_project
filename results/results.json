@@ -1,1 +1,164 @@
-[]
+[
+  {
+    "matrix": "1138_bus",
+    "tile": {
+      "algo": "TileSpGEMM",
+      "matrix": "1138_bus",
+      "time_ms": 0.913,
+      "gflops": 0.039733,
+      "mem_bytes": 437586,
+      "nnz_C": 12789,
+      "flops": 36276,
+      "step1_ms": 0.4039,
+      "step2_ms": 0.4106,
+      "step3_ms": 0.0985,
+      "conversion_ms": 0.3128,
+      "tiled_bytes": 79584,
+      "csr_bytes": 53204
+    },
+    "row": {
+      "algo": "RowSpGEMM",
+      "matrix": "1138_bus",
+      "time_ms": 0.1283,
+      "gflops": 0.28277,
+      "mem_bytes": 916668,
+      "nnz_C": 11142,
+      "flops": 36276
+    }
+  },
+  {
+    "matrix": "bcspwr06",
+    "tile": {
+      "algo": "TileSpGEMM",
+      "matrix": "bcspwr06",
+      "time_ms": 0.7784,
+      "gflops": 0.058842,
+      "mem_bytes": 522192,
+      "nnz_C": 16676,
+      "flops": 45800,
+      "step1_ms": 0.3591,
+      "step2_ms": 0.3297,
+      "step3_ms": 0.0896,
+      "conversion_ms": 0.433,
+      "tiled_bytes": 103488,
+      "csr_bytes": 69420
+    },
+    "row": {
+      "algo": "RowSpGEMM",
+      "matrix": "bcspwr06",
+      "time_ms": 0.1167,
+      "gflops": 0.392338,
+      "mem_bytes": 1136892,
+      "nnz_C": 14110,
+      "flops": 45800
+    }
+  },
+  {
+    "matrix": "bcspwr07",
+    "tile": {
+      "algo": "TileSpGEMM",
+      "matrix": "bcspwr07",
+      "time_ms": 0.802,
+      "gflops": 0.062931,
+      "mem_bytes": 585182,
+      "nnz_C": 17999,
+      "flops": 50468,
+      "step1_ms": 0.3679,
+      "step2_ms": 0.3295,
+      "step3_ms": 0.1046,
+      "conversion_ms": 0.473,
+      "tiled_bytes": 116720,
+      "csr_bytes": 76340
+    },
+    "row": {
+      "algo": "RowSpGEMM",
+      "matrix": "bcspwr07",
+      "time_ms": 0.1187,
+      "gflops": 0.425216,
+      "mem_bytes": 1263180,
+      "nnz_C": 15684,
+      "flops": 50468
+    }
+  },
+  {
+    "matrix": "bcspwr08",
+    "tile": {
+      "algo": "TileSpGEMM",
+      "matrix": "bcspwr08",
+      "time_ms": 0.8795,
+      "gflops": 0.062031,
+      "mem_bytes": 642942,
+      "nnz_C": 19475,
+      "flops": 54556,
+      "step1_ms": 0.4091,
+      "step2_ms": 0.3492,
+      "step3_ms": 0.1212,
+      "conversion_ms": 0.519,
+      "tiled_bytes": 123856,
+      "csr_bytes": 79100
+    },
+    "row": {
+      "algo": "RowSpGEMM",
+      "matrix": "bcspwr08",
+      "time_ms": 0.1216,
+      "gflops": 0.448533,
+      "mem_bytes": 1349196,
+      "nnz_C": 16916,
+      "flops": 54556
+    }
+  },
+  {
+    "matrix": "bcspwr09",
+    "tile": {
+      "algo": "TileSpGEMM",
+      "matrix": "bcspwr09",
+      "time_ms": 1.4478,
+      "gflops": 0.041168,
+      "mem_bytes": 1319048,
+      "nnz_C": 25858,
+      "flops": 59602,
+      "step1_ms": 0.4199,
+      "step2_ms": 0.3625,
+      "step3_ms": 0.6655,
+      "conversion_ms": 0.6831,
+      "tiled_bytes": 217530,
+      "csr_bytes": 85028
+    },
+    "row": {
+      "algo": "RowSpGEMM",
+      "matrix": "bcspwr09",
+      "time_ms": 0.1383,
+      "gflops": 0.431049,
+      "mem_bytes": 1472436,
+      "nnz_C": 18485,
+      "flops": 59602
+    }
+  },
+  {
+    "matrix": "bcsstk13",
+    "tile": {
+      "algo": "TileSpGEMM",
+      "matrix": "bcsstk13",
+      "time_ms": 1.6844,
+      "gflops": 5.407925,
+      "mem_bytes": 9418408,
+      "nnz_C": 711522,
+      "flops": 9109082,
+      "step1_ms": 0.3891,
+      "step2_ms": 0.4168,
+      "step3_ms": 0.8785,
+      "conversion_ms": 7.081,
+      "tiled_bytes": 955818,
+      "csr_bytes": 1014612
+    },
+    "row": {
+      "algo": "RowSpGEMM",
+      "matrix": "bcsstk13",
+      "time_ms": 3.1552,
+      "gflops": 2.886977,
+      "mem_bytes": 160154292,
+      "nnz_C": 396773,
+      "flops": 9109082
+    }
+  }
+]

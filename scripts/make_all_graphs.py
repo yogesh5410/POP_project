@@ -10,11 +10,12 @@ GRAPHS_DIR   = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.path.dirnam
 PYTHON       = sys.executable
 
 PLOTS = [
-    ('plot_gflops.py',            'Figure 1 — GFlops comparison'),
-    ('plot_peak_space.py',        'Figure 2 — Peak space cost'),
-    ('plot_runtime_breakdown.py', 'Figure 3 — Runtime breakdown'),
-    ('plot_conversion_time.py',   'Figure 4 — Conversion time vs SpGEMM time'),
-    ('plot_space_comparison.py',  'Figure 5 — CSR vs Tiled space'),
+    ('plot_runtime.py',           'Figure 1 — Runtime comparison'),
+    ('plot_gflops.py',            'Figure 2 — GFlops comparison'),
+    ('plot_peak_space.py',        'Figure 3 — Peak space cost'),
+    ('plot_runtime_breakdown.py', 'Figure 4 — Runtime breakdown'),
+    ('plot_conversion_time.py',   'Figure 5 — Conversion time vs SpGEMM time'),
+    ('plot_space_comparison.py',  'Figure 6 — CSR vs Tiled space'),
 ]
 
 print(f"\n{'='*60}", flush=True)

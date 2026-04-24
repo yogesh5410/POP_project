@@ -91,12 +91,12 @@ build: _build
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
-$(ROW_TARGET): $(SRC_DIR)/row_spgemm.cu $(SRC_DIR)/common.h | $(BUILD_DIR)
+$(ROW_TARGET): $(SRC_DIR)/row_spgemm.cu | $(BUILD_DIR)
 	@echo "[Build] Compiling RowSpGEMM ($(GPU_ARCH)) ..."
 	$(NVCC) $(NVCC_FLAGS) -o $@ $< $(NVCC_LDFLAGS)
 	@echo "[Build] row_spgemm -> $@"
 
-$(TILE_TARGET): $(SRC_DIR)/tile_spgemm.cu $(SRC_DIR)/common.h | $(BUILD_DIR)
+$(TILE_TARGET): $(SRC_DIR)/tile_spgemm.cu | $(BUILD_DIR)
 	@echo "[Build] Compiling TileSpGEMM ($(GPU_ARCH)) ..."
 	$(NVCC) $(NVCC_FLAGS) -o $@ $< $(NVCC_LDFLAGS)
 	@echo "[Build] tile_spgemm -> $@"
