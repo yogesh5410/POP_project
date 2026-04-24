@@ -27,13 +27,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  TILE CONSTANTS
  * ═══════════════════════════════════════════════════════════════════════════ */
 #define TILE_DIM      16          /* tile is TILE_DIM × TILE_DIM             */
 #define TILE_SIZE     256         /* TILE_DIM * TILE_DIM                     */
-#define DENSE_THRESH  192         /* 75% of TILE_SIZE → use dense accumulator */
 #define WARP_SIZE     32
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -430,8 +430,6 @@ void step2_symbolic_kernel(
     const int *B_colPtr,
     const int *B_rowIdxByCol,
     const int *B_tilePosByCol,
-    const int *B_tileNnz,
-    const unsigned char  *B_rowPtr,
     const unsigned short *B_mask,
     /* C tile structure (from step 1) */
     const int *C_tilePtr,   /* [tilem_C+1] */
@@ -538,113 +536,6 @@ void step2_symbolic_kernel(
         }
         C_tileNnz[wid] = total;
     }
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- *  STEP 3 – Numeric phase kernel
- *  One warp per output tile.
- *  Adaptive sparse/dense accumulator in shared memory.
- * ═══════════════════════════════════════════════════════════════════════════ */
-__global__
-void step3_numeric_kernel(
-    /* A */
-    const int *A_tilePtr, const int *A_tileColIdx, const int *A_tileNnz,
-    const unsigned char *A_rowPtr, const unsigned char *A_rowIdx,
-    const unsigned char *A_colIdx, const double *A_val,
-    const unsigned short *A_mask,
-    /* B */
-    const int *B_tilePtr, const int *B_tileColIdx, const int *B_tileNnz,
-    const unsigned char *B_rowPtr, const unsigned char *B_rowIdx,
-    const unsigned char *B_colIdx, const double *B_val,
-    /* C structure (from step 2) */
-    const int *C_tilePtr, const int *C_tileColIdx,
-    const int *C_tileNnzPrefix,  /* inclusive prefix sum [numTilesC] */
-    const int *C_tileNnz,
-    const unsigned char  *C_rowPtr,
-    const unsigned short *C_mask,
-    /* C output */
-    unsigned char *C_rowIdx_out,
-    unsigned char *C_colIdx_out,
-    double        *C_val_out,
-    int numTilesC, int tilem_A)
-{
-    int tid  = blockIdx.x * blockDim.x + threadIdx.x;
-    int wid  = tid / WARP_SIZE;
-    int lane = tid % WARP_SIZE;
-    if (wid >= numTilesC) return;
-
-    /* Locate tile (tile_i, tile_j) */
-    int tile_i = -1, tile_j = -1;
-    if (lane == 0) {
-        int lo=0, hi=tilem_A-1;
-        while(lo<=hi){
-            int mid=(lo+hi)>>1;
-            if(C_tilePtr[mid]<=wid && wid<C_tilePtr[mid+1]){tile_i=mid;break;}
-            else if(C_tilePtr[mid+1]<=wid) lo=mid+1;
-            else hi=mid-1;
-        }
-        tile_j = C_tileColIdx[wid];
-    }
-    tile_i = __shfl_sync(0xFFFFFFFF, tile_i, 0);
-    tile_j = __shfl_sync(0xFFFFFFFF, tile_j, 0);
-    if (tile_i < 0) return;
-
-    int nnzC_tile = C_tileNnz[wid];
-    int outBase   = C_tileNnzPrefix[wid];
-
-    /* Shared accumulators */
-    /* Dense: 256 doubles + 256 flags; Sparse: 256 doubles addressed by linear idx */
-    __shared__ double s_dense[32][TILE_SIZE];  /* 32 warps × 256 */
-    __shared__ int    s_dense_used[32];
-    int wb = threadIdx.x / WARP_SIZE;
-
-    /* Zero the accumulator */
-    for (int k = lane; k < TILE_SIZE; k += WARP_SIZE)
-        s_dense[wb][k] = 0.0;
-    if (lane==0) s_dense_used[wb] = (nnzC_tile >= DENSE_THRESH) ? 1 : 0;
-    __syncwarp();
-
-    int lenA = A_tilePtr[tile_i+1] - A_tilePtr[tile_i];
-    int lenB = B_tilePtr[tile_j+1] - B_tilePtr[tile_j];
-    int baseA = A_tilePtr[tile_i];
-    int baseB = B_tilePtr[tile_j];
-
-    /* Iterate over matched pairs */
-    for (int ia = 0; ia < lenA; ia++) {
-        int col_a = A_tileColIdx[baseA + ia];
-        int found_b = binary_search_tile(B_tileColIdx + baseB, lenB, col_a);
-        if (found_b < 0) continue;
-        int posA = baseA + ia;
-        int posB = baseB + found_b;
-        int nnzA = A_tileNnz[posA];
-        int nnzB = B_tileNnz[posB];
-
-        if (s_dense_used[wb]) {
-            /* Dense accumulator: lane processes nonzeros of A tile */
-            for (int ka = lane; ka < nnzA; ka += WARP_SIZE) {
-                int ra = A_rowIdx[/* offset */0]; /* we need the flat offset */
-                /* Flat index of nonzero ka in tile posA */
-                int flat_a = (int)A_rowPtr[posA * TILE_DIM + 0]; /* = 0 for first row */
-                /* Actually iterate with nnzA linearly */
-                (void)flat_a;
-                /* Simpler: use colIdx array offset from tileNnzPrefix */
-                /* We don't have prefix here; use posA linearly from A's data */
-                /* A_rowIdx, A_colIdx, A_val are in tile-order, tile posA starts at
-                   cumulative offset – we pass base offset via C_tileNnzPrefix trick.
-                   For correctness use per-tile offsets computed on host. */
-                (void)ra; (void)nnzB;
-                break; /* placeholder – see host-side numeric below */
-            }
-        }
-    }
-    /* NOTE: The full numeric kernel requires per-tile data offsets that are
-       non-trivial to pass purely as kernel args without a prefix-sum array
-       for A and B tiles. We implement the numeric phase on the HOST for
-       correctness, and time ONLY the two GPU steps (1 & 2) as GPU time.
-       Step 3 (numeric with values) is done on CPU with the same algorithm
-       and its time is reported separately. This matches common practice in
-       SpGEMM papers where the numeric phase dominates and is timed separately.
-    */
 }
 
 /* ─── Host-side Step 3 (numeric, CPU reference matching GPU structure) ─── */
@@ -765,6 +656,12 @@ static void step3_numeric_cpu(
     free(prefix); free(prefA); free(prefB);
 }
 
+static int keep_entry(int row, int col, double value, int rows, int cols)
+{
+    if (row < 0 || row >= rows || col < 0 || col >= cols) return 0;
+    return fabs(value) > 1e-12;
+}
+
 /* ─── Convert TiledMatrix C result back to CSR for correctness check ────── */
 static void tiled_C_to_csr(const int *h_tilePtrC, const int *h_tileColIdxC,
                              const int *h_tileNnzC,
@@ -790,15 +687,21 @@ static void tiled_C_to_csr(const int *h_tilePtrC, const int *h_tileColIdxC,
         int base=prefix[wid];
         for(int k=0;k<h_tileNnzC[wid];k++){
             int globalRow = tile_i*TILE_DIM + h_rowIdxC[base+k];
-            if(globalRow<rows) rowCnt[globalRow]++;
+            int globalCol = h_tileColIdxC[wid]*TILE_DIM + h_colIdxC[base+k];
+            if (keep_entry(globalRow, globalCol, h_valC[base+k], rows, cols))
+                rowCnt[globalRow]++;
         }
     }
-    *nnzOut = total;
+    int valid_total = 0;
     *h_rowPtrOut = (int*)malloc((rows+1)*sizeof(int));
     (*h_rowPtrOut)[0]=0;
-    for(int r=0;r<rows;r++) (*h_rowPtrOut)[r+1]=(*h_rowPtrOut)[r]+rowCnt[r];
-    *h_colIdxOut = (int*)   malloc(total*sizeof(int));
-    *h_valOut    = (double*)malloc(total*sizeof(double));
+    for(int r=0;r<rows;r++) {
+        valid_total += rowCnt[r];
+        (*h_rowPtrOut)[r+1]=valid_total;
+    }
+    *nnzOut = valid_total;
+    *h_colIdxOut = (int*)   malloc((size_t)valid_total*sizeof(int));
+    *h_valOut    = (double*)malloc((size_t)valid_total*sizeof(double));
     int *cursor = (int*)calloc(rows,sizeof(int));
     for(int wid=0;wid<numTilesC;wid++){
         int tile_i=-1;
@@ -811,7 +714,7 @@ static void tiled_C_to_csr(const int *h_tilePtrC, const int *h_tileColIdxC,
         for(int k=0;k<h_tileNnzC[wid];k++){
             int gr=tile_i*TILE_DIM+(int)h_rowIdxC[base+k];
             int gc=tile_j*TILE_DIM+(int)h_colIdxC[base+k];
-            if(gr>=rows||gc>=cols) continue;
+            if(!keep_entry(gr, gc, h_valC[base+k], rows, cols)) continue;
             int pos=(*h_rowPtrOut)[gr]+cursor[gr];
             (*h_colIdxOut)[pos]=gc;
             (*h_valOut)[pos]=h_valC[base+k];
@@ -820,6 +723,7 @@ static void tiled_C_to_csr(const int *h_tilePtrC, const int *h_tileColIdxC,
     }
     free(rowCnt); free(prefix); free(cursor);
     (void)tilen;
+    (void)total;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -863,6 +767,7 @@ int main(int argc, char **argv)
     /* ── Upload ── */
     fprintf(stderr, "[TileSpGEMM] Uploading tiled matrix to GPU ...\n");
     double t_upload_ms = tiled_upload(&TA);
+    (void)t_upload_ms;
 
     /* B = A (same matrix) */
     TiledMatrix TB;
@@ -913,8 +818,7 @@ int main(int argc, char **argv)
     step2_symbolic_kernel<<<num_blocks, threads_per_block>>>(
         TA.d_tilePtr, TA.d_tileColIdx, TA.d_tileNnz,
         TA.d_rowPtr, TA.d_mask,
-        TBcol.d_colPtr, TBcol.d_rowIdx, TBcol.d_tilePos, TB.d_tileNnz,
-        TB.d_rowPtr, TB.d_mask,
+        TBcol.d_colPtr, TBcol.d_rowIdx, TBcol.d_tilePos, TB.d_mask,
         d_tilePtrC, d_tileColIdxC,
         d_tileNnzC, d_rowPtrC, d_maskC,
         numTilesC, TA.tilem);
@@ -948,14 +852,21 @@ int main(int argc, char **argv)
     double t_step3_start = wtime();
     unsigned char *h_rowIdxC=NULL, *h_colIdxC_res=NULL;
     double *h_valC_res=NULL;
-    int nnzC_check=0;
+    int nnzC_struct=0;
     step3_numeric_cpu(&TA, &TB, &TBcol,
                       h_tilePtrC, h_tileColIdxC,
                       h_tileNnzC, h_rowPtrC, h_maskC,
                       numTilesC,
-                      &h_rowIdxC, &h_colIdxC_res, &h_valC_res, &nnzC_check);
+                      &h_rowIdxC, &h_colIdxC_res, &h_valC_res, &nnzC_struct);
     double t_step3_ms = (wtime()-t_step3_start)*1e3;
-    fprintf(stderr, "[TileSpGEMM] Step 3 done: nnzC=%d, %.2f ms\n", nnzC_check, t_step3_ms);
+    fprintf(stderr, "[TileSpGEMM] Step 3 done: structural nnzC=%d, %.2f ms\n", nnzC_struct, t_step3_ms);
+
+    int *h_rpC=NULL, *h_ciC=NULL; double *h_vC=NULL; int nnzCSR=0;
+    tiled_C_to_csr(h_tilePtrC, h_tileColIdxC, h_tileNnzC,
+                   h_rowIdxC, h_colIdxC_res, h_valC_res,
+                   numTilesC, TA.tilem, TA.tilen, A.rows, A.cols,
+                   &h_rpC, &h_ciC, &h_vC, &nnzCSR);
+    fprintf(stderr, "[TileSpGEMM] Final CSR nnzC=%d after bounds/zero pruning\n", nnzCSR);
 
     /* ─────────────────── Total time ─────────────────── */
     double t_total_ms = t_step1_ms + t_step2_ms + t_step3_ms;
@@ -988,18 +899,13 @@ int main(int argc, char **argv)
            "\"step1_ms\":%.4f,\"step2_ms\":%.4f,\"step3_ms\":%.4f,"
            "\"conversion_ms\":%.4f,"
            "\"tiled_bytes\":%zu,\"csr_bytes\":%zu}\n",
-           mat_name, t_total_ms, gflops, peak_bytes, nnzC_check, flops,
+           mat_name, t_total_ms, gflops, peak_bytes, nnzCSR, flops,
            t_step1_ms, t_step2_ms, t_step3_ms,
            t_conv_ms, tiled_bytes, csr_bytes);
 
     /* ─────────────────── Save C for correctness check ─────────────────── */
     if (do_save) {
         fprintf(stderr, "[TileSpGEMM] Saving C to %s ...\n", save_path);
-        int *h_rpC=NULL, *h_ciC=NULL; double *h_vC=NULL; int nnzCSR=0;
-        tiled_C_to_csr(h_tilePtrC, h_tileColIdxC, h_tileNnzC,
-                       h_rowIdxC, h_colIdxC_res, h_valC_res,
-                       numTilesC, TA.tilem, TA.tilen, A.rows, A.cols,
-                       &h_rpC, &h_ciC, &h_vC, &nnzCSR);
         FILE *fp = fopen(save_path,"wb");
         if (fp) {
             fwrite(&A.rows, sizeof(int),1,fp);
@@ -1010,13 +916,13 @@ int main(int argc, char **argv)
             fwrite(h_vC,  sizeof(double),nnzCSR,  fp);
             fclose(fp);
         }
-        free(h_rpC); free(h_ciC); free(h_vC);
     }
 
     /* ─────────────────── Cleanup ─────────────────── */
     free(h_tilePtrC); free(h_tileColIdxC);
     free(h_tileNnzC); free(h_rowPtrC); free(h_maskC);
     free(h_rowIdxC); free(h_colIdxC_res); free(h_valC_res);
+    free(h_rpC); free(h_ciC); free(h_vC);
     cudaFree(d_tilePtrC); cudaFree(d_tileColIdxC);
     cudaFree(d_tileNnzC); cudaFree(d_rowPtrC); cudaFree(d_maskC);
     /* TB shares TA's host AND device pointers — null them before free */

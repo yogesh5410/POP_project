@@ -24,6 +24,82 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+
+typedef struct {
+    int col;
+    double val;
+} CsrEntry;
+
+static int cmp_csr_entry(const void *a, const void *b)
+{
+    const CsrEntry *ea = (const CsrEntry*)a;
+    const CsrEntry *eb = (const CsrEntry*)b;
+    return (ea->col > eb->col) - (ea->col < eb->col);
+}
+
+static void csr_sort_rows(int rows, int *rowPtr, int *colIdx, double *val)
+{
+    for (int r = 0; r < rows; r++) {
+        int start = rowPtr[r];
+        int end = rowPtr[r + 1];
+        int len = end - start;
+        if (len <= 1) continue;
+        CsrEntry *tmp = (CsrEntry*)malloc((size_t)len * sizeof(CsrEntry));
+        for (int i = 0; i < len; i++) {
+            tmp[i].col = colIdx[start + i];
+            tmp[i].val = val[start + i];
+        }
+        qsort(tmp, (size_t)len, sizeof(CsrEntry), cmp_csr_entry);
+        for (int i = 0; i < len; i++) {
+            colIdx[start + i] = tmp[i].col;
+            val[start + i] = tmp[i].val;
+        }
+        free(tmp);
+    }
+}
+
+static void compare_csr_results(int rows,
+                                const int *rp1, const int *ci1, const double *v1, int nnz1,
+                                const int *rp2, const int *ci2, const double *v2, int nnz2)
+{
+    if (nnz1 != nnz2) {
+        fprintf(stderr, "[CHECK] FAIL: nnz mismatch, row=%d tile=%d\n", nnz1, nnz2);
+        return;
+    }
+    double max_abs_diff = 0.0;
+    int mismatch_row = -1;
+    int mismatch_col = -1;
+    for (int r = 0; r < rows; r++) {
+        int len1 = rp1[r + 1] - rp1[r];
+        int len2 = rp2[r + 1] - rp2[r];
+        if (len1 != len2) {
+            fprintf(stderr, "[CHECK] FAIL: row %d length mismatch, row=%d tile=%d\n", r, len1, len2);
+            return;
+        }
+        for (int k = 0; k < len1; k++) {
+            int idx1 = rp1[r] + k;
+            int idx2 = rp2[r] + k;
+            if (ci1[idx1] != ci2[idx2]) {
+                fprintf(stderr, "[CHECK] FAIL: row %d column mismatch, row=%d tile=%d\n",
+                        r, ci1[idx1], ci2[idx2]);
+                return;
+            }
+            double diff = fabs(v1[idx1] - v2[idx2]);
+            if (diff > max_abs_diff) {
+                max_abs_diff = diff;
+                mismatch_row = r;
+                mismatch_col = ci1[idx1];
+            }
+        }
+    }
+    if (max_abs_diff <= 1e-9) {
+        fprintf(stderr, "[CHECK] PASS: matrices match, max |diff| = %.3e\n", max_abs_diff);
+    } else {
+        fprintf(stderr, "[CHECK] FAIL: max |diff| = %.3e at (%d,%d)\n",
+                max_abs_diff, mismatch_row, mismatch_col);
+    }
+}
 
 /* ─── cuSPARSE SpGEMM wrapper ───────────────────────────────────────────── */
 static double run_row_spgemm(CsrMatrix *A, CsrMatrix *B,
@@ -293,7 +369,7 @@ int main(int argc, char **argv)
            "\"mem_bytes\":%zu,\"nnz_C\":%d,\"flops\":%lld}\n",
            mat_name, time_ms, gflops, peak, nnzC, flops);
 
-    /* Correctness check: compare nnzC with TileSpGEMM result */
+    /* Correctness check: compare full CSR result against TileSpGEMM output */
     if (do_check) {
         fprintf(stderr, "[RowSpGEMM] Correctness check vs TileSpGEMM ...\n");
         FILE *fp = fopen(check_path,"rb");
@@ -302,13 +378,28 @@ int main(int argc, char **argv)
             int rows2,cols2,nnz3;
             if(fread(&rows2,sizeof(int),1,fp) && fread(&cols2,sizeof(int),1,fp)
                && fread(&nnz3,sizeof(int),1,fp)) {
-                if (nnzC == nnz3)
-                    fprintf(stderr,"[CHECK] PASS: both algorithms report nnzC=%d\n", nnzC);
-                else
-                    fprintf(stderr,"[CHECK] INFO: RowSpGEMM nnzC=%d, TileSpGEMM nnzC=%d\n"
-                                   "             Difference due to TileSpGEMM retaining "
-                                   "structurally-zero tiles (allowed by paper design).\n",
-                                   nnzC, nnz3);
+                int *rp2 = (int*)malloc((size_t)(rows2 + 1) * sizeof(int));
+                int *ci2 = (int*)malloc((size_t)nnz3 * sizeof(int));
+                double *v2 = (double*)malloc((size_t)nnz3 * sizeof(double));
+                fread(rp2, sizeof(int), rows2 + 1, fp);
+                fread(ci2, sizeof(int), nnz3, fp);
+                fread(v2, sizeof(double), nnz3, fp);
+
+                int *rp1 = NULL, *ci1 = NULL, nnz1 = 0;
+                double *v1 = NULL;
+                run_row_spgemm_get_C(&A, &B, &rp1, &ci1, &v1, &nnz1);
+
+                if (rows2 != A.rows || cols2 != A.cols) {
+                    fprintf(stderr, "[CHECK] FAIL: dimension mismatch, row=%dx%d tile=%dx%d\n",
+                            A.rows, A.cols, rows2, cols2);
+                } else {
+                    csr_sort_rows(A.rows, rp1, ci1, v1);
+                    csr_sort_rows(rows2, rp2, ci2, v2);
+                    compare_csr_results(A.rows, rp1, ci1, v1, nnz1, rp2, ci2, v2, nnz3);
+                }
+
+                free(rp1); free(ci1); free(v1);
+                free(rp2); free(ci2); free(v2);
             }
             fclose(fp);
         }

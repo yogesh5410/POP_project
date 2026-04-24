@@ -17,6 +17,7 @@ import json
 import subprocess
 import tarfile
 import shutil
+from pathlib import Path
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
@@ -43,32 +44,67 @@ def run(cmd, check=True):
         print(f"[ERROR] Command failed: {' '.join(cmd)}", file=sys.stderr)
     return result
 
-def find_mtx_files():
-    """Extract all tar.gz archives and return list of (name, mtx_path)."""
-    mtx_files = []
-    archives = sorted(glob.glob(os.path.join(DATASET_DIR, '*.tar.gz')))
-    for arch in archives:
-        name = os.path.basename(arch).replace('.tar.gz','')
+def _extract_archives():
+    """Extract all dataset archives present at the Dataset root."""
+    archive_patterns = ('*.tar.gz', '*.tgz')
+    archives = []
+    for pattern in archive_patterns:
+        archives.extend(glob.glob(os.path.join(DATASET_DIR, pattern)))
+
+    for arch in sorted(set(archives)):
+        stem = os.path.basename(arch)
+        if stem.endswith('.tar.gz'):
+            name = stem[:-7]
+        elif stem.endswith('.tgz'):
+            name = stem[:-4]
+        else:
+            continue
         extract_dir = os.path.join(DATASET_DIR, name)
         if not os.path.isdir(extract_dir):
             print(f"\n[Prepare] Extracting {os.path.basename(arch)} ...", flush=True)
             with tarfile.open(arch, 'r:gz') as tf:
                 tf.extractall(DATASET_DIR)
-        # Find .mtx inside
-        mtx_candidates = glob.glob(os.path.join(DATASET_DIR, name, '*.mtx'))
-        if not mtx_candidates:
-            mtx_candidates = glob.glob(os.path.join(DATASET_DIR, '**', name+'.mtx'), recursive=True)
-        if mtx_candidates:
-            mtx_files.append((name, mtx_candidates[0]))
+
+
+def find_mtx_files():
+    """Return all datasets currently available under Dataset/."""
+    _extract_archives()
+
+    dataset_root = Path(DATASET_DIR)
+    mtx_paths = sorted(dataset_root.rglob('*.mtx'))
+    if not mtx_paths:
+        return []
+
+    discovered = {}
+    for mtx in mtx_paths:
+        rel_parts = mtx.relative_to(dataset_root).parts
+        if len(rel_parts) > 1:
+            name = rel_parts[0]
         else:
-            print(f"[WARN] No .mtx found for {name}", file=sys.stderr)
-    return mtx_files
+            name = mtx.stem
+
+        # Prefer Dataset/<name>/<name>.mtx when multiple MTX files exist.
+        current = discovered.get(name)
+        preferred = (mtx.stem == name)
+        if current is None:
+            discovered[name] = str(mtx)
+        else:
+            current_path = Path(current)
+            current_preferred = (current_path.stem == name)
+            if preferred and not current_preferred:
+                discovered[name] = str(mtx)
+
+    return sorted(discovered.items())
 
 def convert_to_csr(name, mtx_path):
     csr_path = os.path.join(CSR_DIR, name + '.csr')
     if os.path.exists(csr_path):
-        print(f"  [convert] {name}.csr already exists, skipping.", flush=True)
-        return csr_path
+        csr_mtime = os.path.getmtime(csr_path)
+        src_mtime = os.path.getmtime(mtx_path)
+        if csr_mtime >= src_mtime:
+            print(f"  [convert] {name}.csr is up to date, skipping.", flush=True)
+            return csr_path
+        print(f"  [convert] {name}.csr is stale, rebuilding from {mtx_path}.", flush=True)
     print(f"\n[Convert] {name}: {mtx_path} → {csr_path}", flush=True)
     result = run([PYTHON, CONVERT_SCRIPT, mtx_path, csr_path])
     if result.returncode != 0:
