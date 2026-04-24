@@ -5,18 +5,24 @@ Space cost comparison: standard CSR vs our tiled sparse format.
 One scatter/bar per matrix.
 """
 
-import json, sys, os
+import sys, os
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from plot_utils import load_results, valid_entries, save_no_data_figure
 
 RESULTS_FILE = sys.argv[1] if len(sys.argv) > 1 else 'results/results.json'
 OUT_DIR      = sys.argv[2] if len(sys.argv) > 2 else 'graphs'
 os.makedirs(OUT_DIR, exist_ok=True)
 
-with open(RESULTS_FILE) as f:
-    data = json.load(f)
+data = valid_entries(load_results(RESULTS_FILE))
+
+out = os.path.join(OUT_DIR, 'fig5_space_comparison.png')
+if not data:
+    save_no_data_figure(out, 'Space Comparison', 'No valid tile benchmark results found in results.json')
+    print(f"[Plot] Saved: {out}", flush=True)
+    sys.exit(0)
 
 matrices    = []
 csr_mb      = []
@@ -87,7 +93,6 @@ ax.text(0.01, 0.97,
         bbox=dict(facecolor='lightyellow', alpha=0.7, edgecolor='gray'))
 
 plt.tight_layout()
-out = os.path.join(OUT_DIR, 'fig5_space_comparison.png')
 plt.savefig(out, dpi=150, bbox_inches='tight')
 print(f"[Plot] Saved: {out}", flush=True)
 plt.close()

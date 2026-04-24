@@ -5,18 +5,24 @@ Runtime peak memory cost (MB) for each matrix — TileSpGEMM vs RowSpGEMM.
 Side-by-side bar chart.
 """
 
-import json, sys, os
+import sys, os
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from plot_utils import load_results, valid_entries, save_no_data_figure
 
 RESULTS_FILE = sys.argv[1] if len(sys.argv) > 1 else 'results/results.json'
 OUT_DIR      = sys.argv[2] if len(sys.argv) > 2 else 'graphs'
 os.makedirs(OUT_DIR, exist_ok=True)
 
-with open(RESULTS_FILE) as f:
-    data = json.load(f)
+data = valid_entries(load_results(RESULTS_FILE))
+
+out = os.path.join(OUT_DIR, 'fig2_peak_space_cost.png')
+if not data:
+    save_no_data_figure(out, 'Peak Space Cost', 'No valid benchmark results found in results.json')
+    print(f"[Plot] Saved: {out}", flush=True)
+    sys.exit(0)
 
 matrices  = []
 row_mb    = []
@@ -68,7 +74,6 @@ for i, (rms, tms) in enumerate(zip(row_ms, tile_ms)):
                 fontsize=6, ha='center', va='top', color='dimgray')
 
 plt.tight_layout()
-out = os.path.join(OUT_DIR, 'fig2_peak_space_cost.png')
 plt.savefig(out, dpi=150, bbox_inches='tight')
 print(f"[Plot] Saved: {out}", flush=True)
 plt.close()

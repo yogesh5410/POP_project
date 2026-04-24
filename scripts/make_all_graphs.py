@@ -11,6 +11,7 @@ PYTHON       = sys.executable
 
 PLOTS = [
     ('plot_gflops.py',            'Figure 1 — GFlops comparison'),
+    ('plot_runtime.py',           'Runtime comparison'),
     ('plot_peak_space.py',        'Figure 2 — Peak space cost'),
     ('plot_runtime_breakdown.py', 'Figure 3 — Runtime breakdown'),
     ('plot_conversion_time.py',   'Figure 4 — Conversion time vs SpGEMM time'),
@@ -21,6 +22,7 @@ print(f"\n{'='*60}", flush=True)
 print("  Generating all graphs ...", flush=True)
 print(f"{'='*60}", flush=True)
 
+failed = False
 for script, desc in PLOTS:
     path = os.path.join(SCRIPT_DIR, script)
     print(f"\n[Graph] {desc}", flush=True)
@@ -28,6 +30,9 @@ for script, desc in PLOTS:
                        capture_output=False, text=True)
     if r.returncode != 0:
         print(f"  [WARN] {script} exited with code {r.returncode}", flush=True)
+        failed = True
 
 print(f"\n[Done] All graphs saved to: {GRAPHS_DIR}", flush=True)
 print(f"       Files: {sorted(os.listdir(GRAPHS_DIR))}", flush=True)
+if failed:
+    sys.exit(1)

@@ -5,19 +5,25 @@ Performance comparison (GFlops) for each matrix — TileSpGEMM vs RowSpGEMM.
 Grouped bar chart, one group per matrix.
 """
 
-import json, sys, os
+import sys, os
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+from plot_utils import load_results, valid_entries, save_no_data_figure
 
 RESULTS_FILE = sys.argv[1] if len(sys.argv) > 1 else 'results/results.json'
 OUT_DIR      = sys.argv[2] if len(sys.argv) > 2 else 'graphs'
 os.makedirs(OUT_DIR, exist_ok=True)
 
-with open(RESULTS_FILE) as f:
-    data = json.load(f)
+data = valid_entries(load_results(RESULTS_FILE))
+
+out = os.path.join(OUT_DIR, 'fig1_gflops_comparison.png')
+if not data:
+    save_no_data_figure(out, 'GFlops Comparison', 'No valid benchmark results found in results.json')
+    print(f"[Plot] Saved: {out}", flush=True)
+    sys.exit(0)
 
 matrices   = []
 row_gflops = []
@@ -73,7 +79,6 @@ for i,(rg,tg) in enumerate(zip(row_gflops, tile_gflops)):
                 fontsize=7, color='red', rotation=90)
 
 plt.tight_layout()
-out = os.path.join(OUT_DIR, 'fig1_gflops_comparison.png')
 plt.savefig(out, dpi=150, bbox_inches='tight')
 print(f"[Plot] Saved: {out}", flush=True)
 plt.close()

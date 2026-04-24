@@ -163,6 +163,7 @@ def main():
     print(f"\n[Info] Found {len(mtx_files)} matrices: {[n for n,_ in mtx_files]}", flush=True)
 
     all_results = []
+    success_count = 0
 
     for name, mtx_path in mtx_files:
         print(f"\n{'─'*60}", flush=True)
@@ -180,23 +181,34 @@ def main():
         # Step 3: RowSpGEMM (+ correctness check against tile result)
         row_data = run_row_spgemm(name, csr_path, tile_c_path)
 
-        entry = {'matrix': name}
+        entry = {'matrix': name, 'mtx_path': mtx_path}
         if tile_data:
             entry['tile'] = tile_data
+            success_count += 1
             print(f"  [Result] TileSpGEMM: {tile_data.get('time_ms',0):.2f} ms, "
                   f"{tile_data.get('gflops',0):.2f} GFlops", flush=True)
         if row_data:
             entry['row']  = row_data
+            success_count += 1
             print(f"  [Result] RowSpGEMM:  {row_data.get('time_ms',0):.2f} ms, "
                   f"{row_data.get('gflops',0):.2f} GFlops", flush=True)
 
-        all_results.append(entry)
+        if tile_data or row_data:
+            all_results.append(entry)
+        else:
+            print(f"  [WARN] Skipping {name}: neither implementation produced a valid result.",
+                  file=sys.stderr)
 
     # Save combined results
     results_file = os.path.join(RESULTS_DIR, 'results.json')
     with open(results_file, 'w') as f:
         json.dump(all_results, f, indent=2)
     print(f"\n[Done] Results saved to {results_file}", flush=True)
+
+    if not all_results or success_count == 0:
+        print("[ERROR] No valid benchmark results were produced. Graph generation will be meaningless.",
+              file=sys.stderr)
+        sys.exit(2)
 
 if __name__ == '__main__':
     main()
