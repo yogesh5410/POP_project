@@ -294,6 +294,8 @@ static double step1_tile_structure(const TiledMatrix *A, const TiledMatrix *B,
 
     double alpha=1.0,beta=0.0;
     cusparseSpGEMMDescr_t desc; CUSPARSE_CHECK(cusparseSpGEMM_createDescr(&desc));
+    /* BUG FIX (Bug 5): time the FULL step including work estimation */
+    double t0=wtime();
     size_t bs1=0; void *b1=NULL;
     CUSPARSE_CHECK(cusparseSpGEMM_workEstimation(handle,
         CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,
@@ -308,7 +310,6 @@ static double step1_tile_structure(const TiledMatrix *A, const TiledMatrix *B,
         &alpha,mA,mB,&beta,mC,CUDA_R_64F,CUSPARSE_SPGEMM_DEFAULT,desc,&bs2,NULL));
     CUDA_CHECK(cudaMalloc(&b2,bs2?bs2:1));
 
-    double t0=wtime();
     CUSPARSE_CHECK(cusparseSpGEMM_compute(handle,
         CUSPARSE_OPERATION_NON_TRANSPOSE,CUSPARSE_OPERATION_NON_TRANSPOSE,
         &alpha,mA,mB,&beta,mC,CUDA_R_64F,CUSPARSE_SPGEMM_DEFAULT,desc,&bs2,b2));
@@ -341,17 +342,26 @@ static double step1_tile_structure(const TiledMatrix *A, const TiledMatrix *B,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  STEP 2 — Symbolic phase kernel
- *  1 warp per C-tile; each lane handles one A_ik tile, binary-searches B_kj.
- *  AtomicOr on per-warp shared mask → C bitmask + rowPtr + nnz per tile.
+ *  STEP 2 — Symbolic phase kernel (optimized + bug-fixed)
+ *
+ *  1 warp per C-tile; each lane handles A tiles at stride WARP_SIZE.
+ *
+ *  BUG FIX (Bug 1): For C-tile(tile_i, tile_j) = Σ_k A[tile_i][k]×B[k][tile_j],
+ *    each A tile's column is k.  We must search B's tile-ROW k for tile-col
+ *    tile_j — not B's tile-row tile_j for col_a as the old code did.
+ *    The old approach was only correct because all test matrices are symmetric.
+ *
+ *  BUG FIX (Bug 3): Removed dead parameters A_tileNnz, B_tileNnz,
+ *    A_rowPtr, B_rowPtr (were suppressed with (void) in the old kernel).
+ *
+ *  OPTIMIZATION: Register-local mask accumulation per lane followed by
+ *    warp-shuffle XOR reduction — eliminates all atomicOr on shared memory.
  * ═══════════════════════════════════════════════════════════════════════ */
 __global__
 void step2_symbolic_kernel(
     const int            *A_tilePtr, const int *A_tileColIdx,
-    const int            *A_tileNnz, const unsigned char *A_rowPtr,
     const unsigned short *A_mask,
     const int            *B_tilePtr, const int *B_tileColIdx,
-    const int            *B_tileNnz, const unsigned char *B_rowPtr,
     const unsigned short *B_mask,
     const int            *C_tileColIdx, const int *d_tile_row,
     int *C_tileNnz, unsigned char *C_rowPtr, unsigned short *C_mask,
@@ -363,49 +373,65 @@ void step2_symbolic_kernel(
     int wb   = threadIdx.x / WARP_SIZE;
     if (wid >= numTilesC) return;
 
-    __shared__ unsigned int s_mask[WARPS_PER_BLOCK][TILE_DIM];
-    if (lane < TILE_DIM) s_mask[wb][lane] = 0u;
-    __syncwarp();
-
     int tile_i = d_tile_row[wid];
     int tile_j = C_tileColIdx[wid];
     int lenA   = A_tilePtr[tile_i+1] - A_tilePtr[tile_i];
-    int lenB   = B_tilePtr[tile_j+1] - B_tilePtr[tile_j];
     int baseA  = A_tilePtr[tile_i];
-    int baseB  = B_tilePtr[tile_j];
+
+    /* Each lane accumulates its own contribution into register-local masks */
+    unsigned int local_mask[TILE_DIM];
+    for (int r = 0; r < TILE_DIM; r++) local_mask[r] = 0u;
 
     for (int ia = lane; ia < lenA; ia += WARP_SIZE) {
-        int col_a = A_tileColIdx[baseA + ia];
-        int lo=0, hi=lenB-1, found_b=-1;
+        int col_a = A_tileColIdx[baseA + ia];  /* k = intermediate tile-col */
+
+        /* BUG FIX (Bug 1): search B's tile-ROW col_a for tile-col tile_j */
+        int lenB_k  = B_tilePtr[col_a+1] - B_tilePtr[col_a];
+        int baseB_k = B_tilePtr[col_a];
+        int lo=0, hi=lenB_k-1, found_b=-1;
         while (lo<=hi) {
-            int mid=(lo+hi)>>1, v=B_tileColIdx[baseB+mid];
-            if      (v==col_a) { found_b=mid; break; }
-            else if (v< col_a)   lo=mid+1;
-            else                  hi=mid-1;
+            int mid=(lo+hi)>>1, v=B_tileColIdx[baseB_k+mid];
+            if      (v==tile_j) { found_b=mid; break; }
+            else if (v< tile_j)   lo=mid+1;
+            else                   hi=mid-1;
         }
         if (found_b < 0) continue;
+
         int posA = baseA + ia;
-        int posB = baseB + found_b;
-        (void)A_tileNnz; (void)B_tileNnz; (void)A_rowPtr; (void)B_rowPtr;
-        for (int r=0; r<TILE_DIM; r++) {
-            unsigned short mA = A_mask[(size_t)posA*TILE_DIM+r];
+        int posB = baseB_k + found_b;
+
+        /* Accumulate column contributions into local register masks */
+        for (int r = 0; r < TILE_DIM; r++) {
+            unsigned short mA = A_mask[(size_t)posA * TILE_DIM + r];
+            unsigned int contrib = 0u;
             while (mA) {
                 int c = __ffs((int)(unsigned int)mA) - 1;
-                mA &= (unsigned short)(mA-1);
-                atomicOr(&s_mask[wb][r], (unsigned int)B_mask[(size_t)posB*TILE_DIM+c]);
+                mA &= (unsigned short)(mA - 1);
+                contrib |= (unsigned int)B_mask[(size_t)posB * TILE_DIM + c];
             }
+            local_mask[r] |= contrib;
         }
+    }
+
+    /* Warp-reduce local_mask via shuffle XOR — no shared-memory atomics */
+    __shared__ unsigned int s_mask[WARPS_PER_BLOCK][TILE_DIM];
+    for (int r = 0; r < TILE_DIM; r++) {
+        unsigned int v = local_mask[r];
+        for (int off = WARP_SIZE/2; off > 0; off >>= 1)
+            v |= __shfl_xor_sync(0xFFFFFFFFu, v, off);
+        if (lane == 0) s_mask[wb][r] = v;
     }
     __syncwarp();
 
     if (lane < TILE_DIM)
-        C_mask[(size_t)wid*TILE_DIM+lane] = (unsigned short)(s_mask[wb][lane] & 0xFFFFu);
+        C_mask[(size_t)wid * TILE_DIM + lane] =
+            (unsigned short)(s_mask[wb][lane] & 0xFFFFu);
     __syncwarp();
 
     if (lane == 0) {
-        int total=0; unsigned char acc=0;
-        for (int r=0; r<TILE_DIM; r++) {
-            C_rowPtr[(size_t)wid*TILE_DIM+r] = acc;
+        int total = 0; unsigned char acc = 0;
+        for (int r = 0; r < TILE_DIM; r++) {
+            C_rowPtr[(size_t)wid * TILE_DIM + r] = acc;
             int cnt = __popc(s_mask[wb][r]);
             total += cnt; acc += (unsigned char)cnt;
         }
@@ -414,11 +440,22 @@ void step2_symbolic_kernel(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
- *  STEP 3 — Numeric phase kernel (fully GPU)
- *  1 block per C-tile, TILE_SIZE=256 threads (one per C[r][c] slot).
- *  Thread 0 finds all matched (A_ik, B_kj) pairs via binary search,
- *  stores in shared memory; all 256 threads then independently accumulate.
- *  No atomics on output — each thread writes a unique position.
+ *  STEP 3 — Numeric phase kernel (fully GPU, optimized + bug-fixed)
+ *
+ *  1 block per C-tile; TILE_SIZE=256 threads, one thread per C[r][c] slot.
+ *
+ *  BUG FIX (Bug 1): B tile-row is now searched per k (= col_a), looking for
+ *    tile-col tile_j.  The old code searched B's tile-row tile_j for col_a,
+ *    which was wrong for non-symmetric matrices.
+ *
+ *  BUG FIX (Bug 2): All 256 threads participate in pair-finding via a
+ *    grid-stride loop + atomicAdd on s_npairs (was: only thread 0).
+ *
+ *  BUG FIX (Bug 4): Overflow of MAX_PAIRS now prints a warning (was silent).
+ *
+ *  OPTIMIZATION: B[ca][c] looked up in O(1) using B_mask bitmask + __popc
+ *    to derive the storage offset — replaces the inner linear scan over
+ *    B tile row ca (up to 16 iterations).
  * ═══════════════════════════════════════════════════════════════════════ */
 __global__
 void step3_numeric_kernel(
@@ -426,6 +463,7 @@ void step3_numeric_kernel(
     const unsigned char *A_rowPtr, const unsigned char *A_colIdx, const double *A_val,
     const int *B_tilePtr, const int *B_tileColIdx, const int *B_tileNnzPrefix,
     const unsigned char *B_rowPtr, const unsigned char *B_colIdx, const double *B_val,
+    const unsigned short *B_mask,                    /* NEW: for O(1) col lookup */
     const int *C_tileColIdx, const int *C_tileNnzPrefix,
     const unsigned char *C_rowPtr, const unsigned short *C_mask,
     const int *d_tile_row,
@@ -442,33 +480,47 @@ void step3_numeric_kernel(
     int tile_i = d_tile_row[tile_idx];
     int tile_j = C_tileColIdx[tile_idx];
     int lenA   = A_tilePtr[tile_i+1] - A_tilePtr[tile_i];
-    int lenB   = B_tilePtr[tile_j+1] - B_tilePtr[tile_j];
     int baseA  = A_tilePtr[tile_i];
-    int baseB  = B_tilePtr[tile_j];
 
     __shared__ int s_posA[MAX_PAIRS];
     __shared__ int s_posB[MAX_PAIRS];
     __shared__ int s_npairs;
+    __shared__ int s_overflow;
 
-    if (slot == 0) {
-        int np = 0;
-        for (int ia = 0; ia < lenA; ia++) {
-            int col_a = A_tileColIdx[baseA + ia];
-            int lo=0, hi=lenB-1;
-            while (lo<=hi) {
-                int mid=(lo+hi)>>1, v=B_tileColIdx[baseB+mid];
-                if (v==col_a) {
-                    if (np < MAX_PAIRS) { s_posA[np]=baseA+ia; s_posB[np]=baseB+mid; np++; }
-                    break;
-                } else if (v<col_a) lo=mid+1; else hi=mid-1;
-            }
+    if (slot == 0) { s_npairs = 0; s_overflow = 0; }
+    __syncthreads();
+
+    /* BUG FIX (Bug 2): all 256 threads find pairs in parallel */
+    for (int ia = slot; ia < lenA; ia += TILE_SIZE) {
+        int col_a = A_tileColIdx[baseA + ia];
+
+        /* BUG FIX (Bug 1): search B's tile-ROW col_a for tile-col tile_j */
+        int lenB_k  = B_tilePtr[col_a+1] - B_tilePtr[col_a];
+        int baseB_k = B_tilePtr[col_a];
+        int lo=0, hi=lenB_k-1;
+        while (lo<=hi) {
+            int mid=(lo+hi)>>1, v=B_tileColIdx[baseB_k+mid];
+            if (v==tile_j) {
+                int idx = atomicAdd(&s_npairs, 1);
+                if (idx < MAX_PAIRS) {
+                    s_posA[idx] = baseA + ia;
+                    s_posB[idx] = baseB_k + mid;
+                } else {
+                    atomicOr(&s_overflow, 1);  /* BUG FIX (Bug 4): flag overflow */
+                }
+                break;
+            } else if (v < tile_j) lo=mid+1; else hi=mid-1;
         }
-        s_npairs = np;
     }
     __syncthreads();
 
+    /* BUG FIX (Bug 4): warn on overflow (only once per tile) */
+    if (slot == 0 && s_overflow)
+        printf("[TileSpGEMM] WARNING: C-tile(%d,%d) has >%d pairs; results truncated!\n",
+               tile_i, tile_j, MAX_PAIRS);
+
     double sum = 0.0;
-    int np = s_npairs;
+    int np = s_npairs < MAX_PAIRS ? s_npairs : MAX_PAIRS;
 
     for (int p = 0; p < np; p++) {
         int posA   = s_posA[p];
@@ -476,27 +528,30 @@ void step3_numeric_kernel(
         int offA   = A_tileNnzPrefix[posA];
         int nnzA_t = A_tileNnzPrefix[posA+1] - offA;
         int offB   = B_tileNnzPrefix[posB];
-        int nnzB_t = B_tileNnzPrefix[posB+1] - offB;
 
-        int raStart = (int)A_rowPtr[(size_t)posA*TILE_DIM + r];
-        int raEnd   = (r < TILE_DIM-1) ? (int)A_rowPtr[(size_t)posA*TILE_DIM+r+1] : nnzA_t;
+        int raStart = (int)A_rowPtr[(size_t)posA * TILE_DIM + r];
+        int raEnd   = (r < TILE_DIM-1)
+                    ? (int)A_rowPtr[(size_t)posA * TILE_DIM + r + 1]
+                    : nnzA_t;
 
         for (int ka = raStart; ka < raEnd; ka++) {
             int    ca = (int)A_colIdx[offA + ka];
             double va = A_val[offA + ka];
-            int bcStart = (int)B_rowPtr[(size_t)posB*TILE_DIM + ca];
-            int bcEnd   = (ca < TILE_DIM-1) ? (int)B_rowPtr[(size_t)posB*TILE_DIM+ca+1] : nnzB_t;
-            for (int kb = bcStart; kb < bcEnd; kb++) {
-                if ((int)B_colIdx[offB+kb] == c) { sum += va * B_val[offB+kb]; break; }
-            }
+
+            /* OPTIMIZATION: O(1) B[ca][c] lookup via bitmask + __popc offset */
+            unsigned short brow_mask = B_mask[(size_t)posB * TILE_DIM + ca];
+            if (!((brow_mask >> c) & 1u)) continue;   /* B[ca][c] == 0 */
+            int bcBase  = (int)B_rowPtr[(size_t)posB * TILE_DIM + ca];
+            int bc_pos  = __popc((unsigned int)(brow_mask & ((1u << c) - 1u)));
+            sum += va * B_val[offB + bcBase + bc_pos];
         }
     }
 
-    unsigned short row_mask = C_mask[(size_t)tile_idx*TILE_DIM + r];
+    unsigned short row_mask = C_mask[(size_t)tile_idx * TILE_DIM + r];
     if (!((row_mask >> c) & 1u)) return;
 
     int outBase = C_tileNnzPrefix[tile_idx];
-    int rstart  = (int)C_rowPtr[(size_t)tile_idx*TILE_DIM + r];
+    int rstart  = (int)C_rowPtr[(size_t)tile_idx * TILE_DIM + r];
     int pos     = __popc((unsigned int)(row_mask & ((1u << c) - 1u)));
     int outIdx  = outBase + rstart + pos;
     C_rowIdx_out[outIdx] = (unsigned char)r;
@@ -591,10 +646,8 @@ int main(int argc, char **argv)
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaEventRecord(ev0));
         step2_symbolic_kernel<<<blocks, threads>>>(
-            TA.d_tilePtr, TA.d_tileColIdx, TA.d_tileNnz,
-            TA.d_rowPtr, TA.d_mask,
-            TB.d_tilePtr, TB.d_tileColIdx, TB.d_tileNnz,
-            TB.d_rowPtr, TB.d_mask,
+            TA.d_tilePtr, TA.d_tileColIdx, TA.d_mask,
+            TB.d_tilePtr, TB.d_tileColIdx, TB.d_mask,
             d_tileColIdxC, d_tile_row,
             d_tileNnzC, d_rowPtrC, d_maskC, numTilesC);
         CUDA_CHECK(cudaEventRecord(ev1));
@@ -638,7 +691,7 @@ int main(int argc, char **argv)
             TA.d_tilePtr, TA.d_tileColIdx, TA.d_tileNnzPrefix,
             TA.d_rowPtr,  TA.d_colIdx, TA.d_val,
             TB.d_tilePtr, TB.d_tileColIdx, TB.d_tileNnzPrefix,
-            TB.d_rowPtr,  TB.d_colIdx, TB.d_val,
+            TB.d_rowPtr,  TB.d_colIdx, TB.d_val, TB.d_mask,
             d_tileColIdxC, d_tileNnzPrefixC, d_rowPtrC, d_maskC, d_tile_row,
             d_rowIdxC, d_colIdxC, d_valC, numTilesC);
         CUDA_CHECK(cudaEventRecord(ev1));
