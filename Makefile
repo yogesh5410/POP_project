@@ -59,6 +59,7 @@ CSR_CACHE     := csr_cache
 
 # ── Compiler flags ─────────────────────────────────────────────────────────
 NVCC_FLAGS    := -O3 -arch=$(GPU_ARCH) \
+                 -std=c++14 \
                  -I$(CUDA_INC_DIR) -I$(SRC_DIR) \
                  -Xcompiler -Wall,-Wextra,-O3 \
                  --extended-lambda \
